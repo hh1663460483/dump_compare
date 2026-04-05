@@ -107,7 +107,9 @@ Input IDs
 | 4 | `layer{idx}_qkv_proj_weight.bin` | QKV 投影权重矩阵 | qkv_proj.weight | L472 |
 | 5 | `layer{idx}_after_qkv_proj.bin` | QKV 投影输出（Q/K/V 拼接张量） | qkv_proj 之后 | L476 |
 | 6 | `layer{idx}_after_attn_op.bin` | 注意力计算输出（attention operation） | attn 计算之后 | L498 |
-| 7 | `layer{idx}_after_attn_layer.bin` | 注意力子层输出（含残差连接） | self_attn + 残差之后 | L611 |
+| 7 | `layer{idx}_after_attn_layer.bin` | 注意力计算最终输出（o_proj 之后） | self_attn 输出 | L611 |
+| 7a | `layer{idx}_after_attn_add_residual.bin` | 注意力子层 + 残差连接 | self_attn + 残差之后 | — |
+| 7b | `layer{idx}_after_post_attention_layernorm.bin` | post_attention_layernorm (RMSNorm) 输出 | post_attention_layernorm 之后 | — |
 
 #### Dense FFN 子层（仅 Dense 层）
 
@@ -170,7 +172,7 @@ Input IDs
 
 ## 4. 执行顺序流程图
 
-### 4.1 Dense 层（idx < first_k_dense_replace）— 每层 9 个 dump 文件
+### 4.1 Dense 层（idx < first_k_dense_replace）— 每层 12 个 dump 文件
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
@@ -200,12 +202,16 @@ Input IDs
 │  │  ⑥ layer{idx}_after_attn_op.bin                 │             │
 │  └──┼──────────────────────────────────────────────┘             │
 │     │                                                             │
+│  ⑦ layer{idx}_after_attn_layer.bin                               │
+│  │                                                                │
 │     ▼  (+残差连接)                                                │
 │                                                                   │
-│  ⑦ layer{idx}_after_attn_layer.bin                               │
+│  ⑦a layer{idx}_after_attn_add_residual.bin                       │
 │  │                                                                │
 │  ▼                                                                │
 │  post_attention_layernorm (RMSNorm)                              │
+│  │                                                                │
+│  ⑦b layer{idx}_after_post_attention_layernorm.bin                │                              │
 │  │                                                                │
 │  ▼                                                                │
 │  ┌─────────── FeedForward (Dense FFN) ────────────┐             │
@@ -234,7 +240,7 @@ Input IDs
 
 ---
 
-### 4.2 MoE 层（idx >= first_k_dense_replace）— 每层最多 19 个 dump 文件
+### 4.2 MoE 层（idx >= first_k_dense_replace）— 每层最多 21 个 dump 文件
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
@@ -251,8 +257,14 @@ Input IDs
 │  │                                                                        │
 │  ⑦ layer{idx}_after_attn_layer.bin                                       │
 │  │                                                                        │
+│     ▼  (+残差连接)                                                        │
+│                                                                           │
+│  ⑦a layer{idx}_after_attn_add_residual.bin                               │
+│  │                                                                        │
 │  ▼                                                                        │
 │  post_attention_layernorm (RMSNorm)                                      │
+│  │                                                                        │
+│  ⑦b layer{idx}_after_post_attention_layernorm.bin                        │                                      │
 │  │                                                                        │
 │  ▼                                                                        │
 │  ┌──────────────────── HYV3MoEFused ──────────────────────────────┐      │
@@ -334,7 +346,7 @@ HYV3DecoderLayer.forward()                        [hunyuan_v3.py]
 ├── dump: input, after_input_layernorm
 ├── HYV3Attention.forward()
 │   ├── dump: qkv_proj_input, qkv_proj_weight, after_qkv_proj, after_attn_op
-├── dump: after_attn_layer
+├── dump: after_attn_layer, after_attn_add_residual, after_post_attention_layernorm
 │
 ├── [Dense 层] HYV3FeedForward.forward()
 │   ├── dump: after_ffn_gate_up_proj, after_ffn_act_fn
@@ -394,5 +406,5 @@ HYV3DecoderLayer.forward()                        [hunyuan_v3.py]
 |------|---------|--------|
 | 层索引范围 | `idx < first_k_dense_replace` | `idx >= first_k_dense_replace` |
 | MLP 类型 | HYV3FeedForward | HYV3MoEFused |
-| dump 文件数/层 | 9 个 | 最多 19 个 (7 + 10 + 2) |
+| dump 文件数/层 | 9 个 | 最多 21 个 (9 + 10 + 2) |
 | 路由相关 dump | 无 | 10 个 (experts_selector) + 2 个 (fused_moe) |

@@ -4,22 +4,22 @@ Dump 数据精度对比脚本 — 对比 Ascend 和 H20 的 dump 数据精度
 =============================================================
 按 dump_data_ascend_说明文档.md 中定义的执行顺序，逐文件比较
 dump_data_ascend 和 dump_data_h20 目录中的张量数据，
-使用 ULP 和 SNR 指标进行精度评估，生成 Markdown 报告和可视化图表。
+使用 ULP 和 SNR 指标进行精度评估，生成 Markdown 报告、可视化图表和 Excel 表格。
 
-图表包括:
-  1. SNR 随层变化折线图（按功能阶段分组）
-  2. within_1ulp 随层变化折线图
-  3. SNR 热力图（dump 点 × 层号）
-  4. 误差累积图（按完整 dump 顺序）
+输出:
+  1. Markdown 报告（按 dump 顺序的完整比对结果 + 汇总 + 质量评估）
+  2. 可视化图表（SNR 折线图、ULP 折线图、SNR 热力图、误差累积图）
+  3. Excel 表格（按 precision_result.xlsx 模板格式）
 
 用法:
   python compare_dump_precision.py \
       --baseline-dir ./dump_data_h20 \
       --test-dir ./dump_data_ascend \
       --output-report ./dump_precision_report.md \
-      --output-charts-dir ./dump_charts
+      --output-charts-dir ./dump_charts \
+      --output-excel ./precision_result_output.xlsx
 
-环境要求: torch, numpy, matplotlib
+环境要求: torch, numpy, matplotlib, openpyxl
 """
 
 import argparse
@@ -58,7 +58,6 @@ def compute_ulp_metrics(baseline: torch.Tensor, test: torch.Tensor) -> dict:
     """
     diff = (baseline - test).abs().float()
     # Use the larger magnitude of baseline and test for ULP reference
-    # This avoids division by near-zero ULP when baseline is 0 but test isn't
     ref = torch.max(baseline.abs(), test.abs())
     ulp = compute_bf16_ulp(ref)
     ulp_count = diff / ulp
@@ -95,6 +94,29 @@ def compute_abs_error_metrics(baseline: torch.Tensor, test: torch.Tensor) -> dic
     return {
         "mean_abs_err": diff.mean().item(),
         "max_abs_err": diff.max().item(),
+        "min_abs_err": diff.min().item(),
+    }
+
+
+def compute_rel_error_metrics(baseline: torch.Tensor, test: torch.Tensor) -> dict:
+    """Compute relative error metrics."""
+    diff = (baseline - test).abs().float()
+    ref = baseline.abs().float().clamp(min=1e-12)
+    rel = diff / ref
+    return {
+        "mean_rel_err": rel.mean().item(),
+        "max_rel_err": rel.max().item(),
+        "min_rel_err": rel.min().item(),
+    }
+
+
+def compute_basic_stats(tensor: torch.Tensor) -> dict:
+    """Compute mean, min, max of a tensor."""
+    t = tensor.float()
+    return {
+        "mean": t.mean().item(),
+        "min": t.min().item(),
+        "max": t.max().item(),
     }
 
 
@@ -110,7 +132,9 @@ STAGE_NAMES = {
     "qkv_proj_weight": "Attention",
     "after_qkv_proj": "Attention",
     "after_attn_op": "Attention",
-    "after_attn_layer": "Attention+Residual",
+    "after_attn_layer": "Attention Output",
+    "after_attn_add_residual": "Attention+Residual",
+    "after_post_attention_layernorm": "Post-Attn LayerNorm",
     "after_ffn_gate_up_proj": "Dense FFN",
     "after_ffn_act_fn": "Dense FFN",
     "experts_input": "MoE Entry",
@@ -133,13 +157,7 @@ STAGE_NAMES = {
     "after_mlp_layer": "MLP+Residual",
 }
 
-# Layer -1 (pre-layer FFN)
-LAYER_NEG1_DUMPS = [
-    "after_ffn_gate_up_proj",
-    "after_ffn_act_fn",
-]
-
-# Dense 层: 10 个文件
+# Dense 层: 12 个文件
 DENSE_LAYER_DUMPS = [
     "input",
     "after_input_layernorm",
@@ -148,12 +166,14 @@ DENSE_LAYER_DUMPS = [
     "after_qkv_proj",
     "after_attn_op",
     "after_attn_layer",
+    "after_attn_add_residual",
+    "after_post_attention_layernorm",
     "after_ffn_gate_up_proj",
     "after_ffn_act_fn",
     "after_mlp_layer",
 ]
 
-# MoE 层: 最多 23 个文件
+# MoE 层: 最多 27 个文件
 MOE_LAYER_DUMPS = [
     "input",
     "after_input_layernorm",
@@ -162,6 +182,8 @@ MOE_LAYER_DUMPS = [
     "after_qkv_proj",
     "after_attn_op",
     "after_attn_layer",
+    "after_attn_add_residual",
+    "after_post_attention_layernorm",
     # MoE 入口
     "experts_input",
     "experts_e_score_correction_bias",
@@ -180,6 +202,9 @@ MOE_LAYER_DUMPS = [
     # fused_moe 入口
     "fused_topk_weights",
     "fused_topk_ids",
+    # MoE 专家输出
+    "after_experts_shared",
+    "after_experts_fused",
     # 层输出
     "after_mlp_layer",
 ]
@@ -199,6 +224,14 @@ class DumpMetrics:
     # Shape info
     baseline_shape: list
     test_shape: list
+    # Baseline (H20) stats
+    baseline_mean: float
+    baseline_min: float
+    baseline_max: float
+    # Test (Ascend) stats
+    test_mean: float
+    test_min: float
+    test_max: float
     # ULP
     mean_ulp: float
     max_ulp: float
@@ -209,6 +242,11 @@ class DumpMetrics:
     # Abs error
     mean_abs_err: float
     max_abs_err: float
+    min_abs_err: float
+    # Rel error
+    mean_rel_err: float
+    max_rel_err: float
+    min_rel_err: float
 
 
 # ===========================================================================
@@ -231,7 +269,6 @@ def align_shapes(bl: torch.Tensor, tl: torch.Tensor) -> Tuple[torch.Tensor, torc
     """Handle shape mismatch by truncating to minimum dimensions."""
     if bl.shape == tl.shape:
         return bl, tl
-    # Truncate each dimension to the minimum
     slices = []
     for d in range(bl.dim()):
         min_size = min(bl.shape[d], tl.shape[d])
@@ -250,7 +287,7 @@ def compare_dumps(
 ) -> List[DumpMetrics]:
     """Compare all dump files between baseline and test directories.
 
-    Iterates layers in order: -1, 0, 1, ..., 39
+    Iterates layers in order: 0, 1, ..., 39
     For each layer, iterates dump points in execution order.
 
     Returns:
@@ -262,7 +299,6 @@ def compare_dumps(
     layer_indices = set()
     for fname in os.listdir(baseline_dir):
         if fname.endswith('.bin') and fname.startswith('layer'):
-            # Extract layer index: "layer{idx}_{name}.bin"
             prefix = fname.split('_', 1)[0]  # "layer0", "layer-1", etc.
             try:
                 idx = int(prefix.replace('layer', ''))
@@ -270,27 +306,22 @@ def compare_dumps(
             except ValueError:
                 continue
 
+    # Filter out layer -1 (no longer needed)
+    layer_indices.discard(-1)
     layer_indices = sorted(layer_indices)
+
+    if not layer_indices:
+        raise FileNotFoundError(f"No valid layer files found in {baseline_dir}")
+
     print(f"Found layers: {layer_indices[0]} to {layer_indices[-1]} ({len(layer_indices)} layers)")
 
     for layer_idx in layer_indices:
         # Select dump list based on layer type
-        if layer_idx == -1:
-            dump_list = LAYER_NEG1_DUMPS
-        elif layer_idx == 0:
-            # Check if this is a dense or MoE layer by seeing what files exist
-            test_file = os.path.join(baseline_dir, f"layer{layer_idx}_experts_input.bin")
-            if os.path.exists(test_file):
-                dump_list = MOE_LAYER_DUMPS
-            else:
-                dump_list = DENSE_LAYER_DUMPS
+        test_file = os.path.join(baseline_dir, f"layer{layer_idx}_experts_input.bin")
+        if os.path.exists(test_file):
+            dump_list = MOE_LAYER_DUMPS
         else:
-            # Check if MoE or Dense
-            test_file = os.path.join(baseline_dir, f"layer{layer_idx}_experts_input.bin")
-            if os.path.exists(test_file):
-                dump_list = MOE_LAYER_DUMPS
-            else:
-                dump_list = DENSE_LAYER_DUMPS
+            dump_list = DENSE_LAYER_DUMPS
 
         for dump_name in dump_list:
             filename = f"layer{layer_idx}_{dump_name}.bin"
@@ -298,7 +329,7 @@ def compare_dumps(
             tl_path = os.path.join(test_dir, filename)
 
             if not os.path.exists(bl_path) or not os.path.exists(tl_path):
-                # Some dumps are conditional (R3, R4, R5, R8), skip if missing
+                # Some dumps are conditional, skip if missing
                 continue
 
             try:
@@ -316,9 +347,12 @@ def compare_dumps(
                 bl_tensor, tl_tensor = align_shapes(bl_tensor, tl_tensor)
 
             # Compute metrics
+            bl_stats = compute_basic_stats(bl_tensor)
+            tl_stats = compute_basic_stats(tl_tensor)
             ulp = compute_ulp_metrics(bl_tensor, tl_tensor)
             snr = compute_snr_db(bl_tensor, tl_tensor)
             abs_err = compute_abs_error_metrics(bl_tensor, tl_tensor)
+            rel_err = compute_rel_error_metrics(bl_tensor, tl_tensor)
 
             stage = STAGE_NAMES.get(dump_name, "Unknown")
 
@@ -329,6 +363,12 @@ def compare_dumps(
                 filename=filename,
                 baseline_shape=orig_bl_shape,
                 test_shape=orig_tl_shape,
+                baseline_mean=bl_stats["mean"],
+                baseline_min=bl_stats["min"],
+                baseline_max=bl_stats["max"],
+                test_mean=tl_stats["mean"],
+                test_min=tl_stats["min"],
+                test_max=tl_stats["max"],
                 mean_ulp=ulp["mean_ulp"],
                 max_ulp=ulp["max_ulp"],
                 within_1ulp_pct=ulp["within_1ulp_pct"],
@@ -336,6 +376,10 @@ def compare_dumps(
                 snr_db=snr,
                 mean_abs_err=abs_err["mean_abs_err"],
                 max_abs_err=abs_err["max_abs_err"],
+                min_abs_err=abs_err["min_abs_err"],
+                mean_rel_err=rel_err["mean_rel_err"],
+                max_rel_err=rel_err["max_rel_err"],
+                min_rel_err=rel_err["min_rel_err"],
             ))
 
         if layer_idx % 5 == 0:
@@ -382,27 +426,22 @@ def generate_markdown_report(
     lines.append("## 2. 按 Dump 顺序的完整比对结果\n")
 
     current_layer = None
+    seq_num = 0
     for r in results:
+        seq_num += 1
         # Print layer header when layer changes
         if r.layer_idx != current_layer:
             current_layer = r.layer_idx
-            if r.layer_idx == -1:
-                layer_type = "Pre-Layer FFN"
-            elif r.layer_idx == 0:
-                # Check if dense
-                has_moe = any(rr.layer_idx == r.layer_idx and "experts" in rr.dump_name for rr in results)
-                layer_type = "MoE" if has_moe else "Dense"
-            else:
-                has_moe = any(rr.layer_idx == r.layer_idx and "experts" in rr.dump_name for rr in results)
-                layer_type = "MoE" if has_moe else "Dense"
+            has_moe = any(rr.layer_idx == r.layer_idx and "experts" in rr.dump_name for rr in results)
+            layer_type = "MoE" if has_moe else "Dense"
 
             lines.append(f"\n### Layer {r.layer_idx} ({layer_type})\n")
             lines.append("| # | Dump Point | Stage | Shape | SNR(dB) | mean_ulp | within_1ulp% | within_2ulp% | mean_abs_err | max_abs_err |")
             lines.append("|---|---|---|---|---|---|---|---|---|---|")
 
-        shape_str = "×".join(str(s) for s in r.baseline_shape)
+        shape_str = "\u00d7".join(str(s) for s in r.baseline_shape)
         lines.append(
-            f"| {results.index(r)+1} | `{r.dump_name}` | {r.stage} | "
+            f"| {seq_num} | `{r.dump_name}` | {r.stage} | "
             f"{shape_str} | "
             f"{_fmt(r.snr_db, '.2f')} | "
             f"{_fmt(r.mean_ulp, '.4f')} | "
@@ -418,7 +457,6 @@ def generate_markdown_report(
     lines.append("| 阶段 | 文件数 | 平均 SNR(dB) | 最小 SNR(dB) | 平均 within_1ulp% | 最小 within_1ulp% | 平均 mean_ulp |")
     lines.append("|---|---|---|---|---|---|---|")
 
-    # Collect unique stages in order of appearance
     seen_stages = []
     for r in results:
         if r.stage not in seen_stages:
@@ -470,7 +508,6 @@ def generate_markdown_report(
     # ── Quality Assessment ──
     lines.append("## 5. 质量评估\n")
 
-    # Overall
     finite_snrs = [r.snr_db for r in results if math.isfinite(r.snr_db)]
     overall_avg_snr = sum(finite_snrs) / len(finite_snrs) if finite_snrs else float('nan')
     overall_avg_w1 = sum(r.within_1ulp_pct for r in results) / len(results)
@@ -480,30 +517,27 @@ def generate_markdown_report(
     lines.append("| 指标 | 值 | 评估 |")
     lines.append("|---|---|---|")
 
-    # SNR assessment
     if math.isfinite(overall_avg_snr):
         if overall_avg_snr >= 60:
-            snr_status = "✅ Excellent"
+            snr_status = "Excellent"
         elif overall_avg_snr >= 50:
-            snr_status = "✅ Good"
+            snr_status = "Good"
         else:
-            snr_status = "⚠️ Needs Investigation"
+            snr_status = "Needs Investigation"
     else:
-        snr_status = "✅ Perfect"
+        snr_status = "Perfect"
     lines.append(f"| 平均 SNR | {_fmt(overall_avg_snr, '.2f')} dB | {snr_status} |")
 
-    # ULP assessment
     if overall_avg_w1 >= 99:
-        ulp_status = "✅ Excellent"
+        ulp_status = "Excellent"
     elif overall_avg_w1 >= 95:
-        ulp_status = "✅ Good"
+        ulp_status = "Good"
     else:
-        ulp_status = "⚠️ Needs Investigation"
+        ulp_status = "Needs Investigation"
     lines.append(f"| 平均 within_1ulp | {_fmt(overall_avg_w1, '.2f')}% | {ulp_status} |")
     lines.append(f"| 平均 mean_ulp | {_fmt(overall_avg_ulp, '.4f')} | |")
     lines.append("")
 
-    # Per-stage assessment
     lines.append("### 各阶段评估\n")
     for stage in seen_stages:
         stage_results = [r for r in results if r.stage == stage]
@@ -551,6 +585,181 @@ def generate_markdown_report(
 
 
 # ===========================================================================
+# Excel report generation
+# ===========================================================================
+
+def generate_excel_report(
+    results: List[DumpMetrics],
+    output_path: str,
+) -> str:
+    """Generate an Excel report following the precision_result.xlsx template.
+
+    Template format (single sheet "precision_data"):
+      Row 1: | (empty) | (empty) | H20 (merged C-E) | 950 (merged F-H) | error/diff (merged I-Q) |
+      Row 2: | (layer label) | layer | mean | min | max | mean | min | max |
+              mean_abs_error | max_abs_error | min_abs_error |
+              mean_rel_error | max_rel_error | min_rel_error |
+              mean_ulp | within_1ulp% | within_2ulp% |
+      Row 3+: data rows grouped by layer, column A has "layerN" for first row of each layer group.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "precision_data"
+
+    # ── Styles ──
+    header_font = Font(bold=True, size=11)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    layer_font = Font(bold=True, size=11, color="1F4E79")
+    center_align = Alignment(horizontal="center", vertical="center")
+    thin_border = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+
+    # ── Row 1: Group headers (merged) ──
+    ws.merge_cells("C1:E1")
+    ws["C1"] = "H20"
+    ws["C1"].font = header_font
+    ws["C1"].alignment = center_align
+    ws["C1"].fill = PatternFill(start_color="B4C6E7", end_color="B4C6E7", fill_type="solid")
+
+    ws.merge_cells("F1:H1")
+    ws["F1"] = "950"
+    ws["F1"].font = header_font
+    ws["F1"].alignment = center_align
+    ws["F1"].fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+
+    ws.merge_cells("I1:Q1")
+    ws["I1"] = "error/diff"
+    ws["I1"].font = header_font
+    ws["I1"].alignment = center_align
+    ws["I1"].fill = PatternFill(start_color="F8CBAD", end_color="F8CBAD", fill_type="solid")
+
+    # ── Row 2: Column headers ──
+    col_headers = [
+        "",           # A: layer group label
+        "layer",      # B: dump point name
+        "mean",       # C: H20 mean
+        "min",        # D: H20 min
+        "max",        # E: H20 max
+        "mean",       # F: 950 mean
+        "min",        # G: 950 min
+        "max",        # H: 950 max
+        "mean_abs_error",   # I
+        "max_abs_error",    # J
+        "min_abs_error",    # K
+        "mean_rel_error",   # L
+        "max_rel_error",    # M
+        "min_rel_error",    # N
+        "mean_ulp",         # O
+        "within_1ulp%",     # P
+        "within_2ulp%",     # Q
+    ]
+    for col_idx, header in enumerate(col_headers, 1):
+        cell = ws.cell(row=2, column=col_idx, value=header)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center_align
+        cell.border = thin_border
+
+    # ── Data rows ──
+    row_num = 3
+    current_layer = None
+    layer_start_row = None
+
+    for r in results:
+        # Write layer label in column A when layer changes
+        if r.layer_idx != current_layer:
+            # Merge previous layer's A column cells if applicable
+            if current_layer is not None and layer_start_row is not None:
+                if row_num - 1 > layer_start_row:
+                    ws.merge_cells(
+                        start_row=layer_start_row, start_column=1,
+                        end_row=row_num - 1, end_column=1,
+                    )
+                cell_a = ws.cell(row=layer_start_row, column=1)
+                cell_a.alignment = Alignment(horizontal="center", vertical="center")
+
+            current_layer = r.layer_idx
+            layer_start_row = row_num
+            ws.cell(row=row_num, column=1, value=f"layer{r.layer_idx}").font = layer_font
+
+        # Column B: dump point name
+        ws.cell(row=row_num, column=2, value=r.dump_name)
+
+        # Columns C-E: H20 (baseline) stats
+        ws.cell(row=row_num, column=3, value=r.baseline_mean)
+        ws.cell(row=row_num, column=4, value=r.baseline_min)
+        ws.cell(row=row_num, column=5, value=r.baseline_max)
+
+        # Columns F-H: 950 (Ascend/test) stats
+        ws.cell(row=row_num, column=6, value=r.test_mean)
+        ws.cell(row=row_num, column=7, value=r.test_min)
+        ws.cell(row=row_num, column=8, value=r.test_max)
+
+        # Columns I-K: abs error
+        ws.cell(row=row_num, column=9, value=r.mean_abs_err)
+        ws.cell(row=row_num, column=10, value=r.max_abs_err)
+        ws.cell(row=row_num, column=11, value=r.min_abs_err)
+
+        # Columns L-N: rel error
+        ws.cell(row=row_num, column=12, value=r.mean_rel_err)
+        ws.cell(row=row_num, column=13, value=r.max_rel_err)
+        ws.cell(row=row_num, column=14, value=r.min_rel_err)
+
+        # Columns O-Q: ULP metrics
+        ws.cell(row=row_num, column=15, value=r.mean_ulp)
+        ws.cell(row=row_num, column=16, value=r.within_1ulp_pct)
+        ws.cell(row=row_num, column=17, value=r.within_2ulp_pct)
+
+        # Apply borders to data cells
+        for col_idx in range(1, 18):
+            ws.cell(row=row_num, column=col_idx).border = thin_border
+
+        row_num += 1
+
+    # Merge the last layer's A column
+    if current_layer is not None and layer_start_row is not None:
+        if row_num - 1 > layer_start_row:
+            ws.merge_cells(
+                start_row=layer_start_row, start_column=1,
+                end_row=row_num - 1, end_column=1,
+            )
+        cell_a = ws.cell(row=layer_start_row, column=1)
+        cell_a.alignment = Alignment(horizontal="center", vertical="center")
+
+    # ── Column widths ──
+    ws.column_dimensions["A"].width = 10
+    ws.column_dimensions["B"].width = 40
+    for col_letter in ["C", "D", "E", "F", "G", "H"]:
+        ws.column_dimensions[col_letter].width = 14
+    for col_letter in ["I", "J", "K", "L", "M", "N"]:
+        ws.column_dimensions[col_letter].width = 16
+    for col_letter in ["O", "P", "Q"]:
+        ws.column_dimensions[col_letter].width = 14
+
+    # ── Number format for data cells ──
+    for row in ws.iter_rows(min_row=3, max_row=row_num - 1, min_col=3, max_col=17):
+        for cell in row:
+            if isinstance(cell.value, float):
+                cell.number_format = '0.000000'
+
+    # ── Freeze panes ──
+    ws.freeze_panes = "C3"
+
+    # Save
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    wb.save(output_path)
+    return output_path
+
+
+# ===========================================================================
 # Chart generation
 # ===========================================================================
 
@@ -561,7 +770,6 @@ def generate_charts(results: List[DumpMetrics], output_dir: str) -> list:
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         from matplotlib.colors import Normalize
-        import matplotlib.ticker as ticker
     except ImportError:
         print("WARNING: matplotlib not available, skipping chart generation")
         return []
@@ -576,7 +784,9 @@ def generate_charts(results: List[DumpMetrics], output_dir: str) -> list:
         "Layer Input": "#1f77b4",
         "Input LayerNorm": "#ff7f0e",
         "Attention": "#2ca02c",
+        "Attention Output": "#98df8a",
         "Attention+Residual": "#d62728",
+        "Post-Attn LayerNorm": "#ff9896",
         "Dense FFN": "#9467bd",
         "MoE Entry": "#8c564b",
         "MoE Routing": "#e377c2",
@@ -589,20 +799,21 @@ def generate_charts(results: List[DumpMetrics], output_dir: str) -> list:
     # ── Chart 1: SNR by layer (key dump points) ──
     fig, ax = plt.subplots(figsize=(16, 7))
 
-    # Select key dump points to plot (avoid clutter)
     key_dumps = [
         "after_input_layernorm",
-        "after_attn_layer",
+        "after_attn_add_residual",
+        "after_post_attention_layernorm",
         "after_router",
         "after_mlp_layer",
     ]
     key_labels = {
         "after_input_layernorm": "Input LayerNorm",
-        "after_attn_layer": "Attn+Residual",
+        "after_attn_add_residual": "Attn+Residual",
+        "after_post_attention_layernorm": "Post-Attn LN",
         "after_router": "Router Output",
         "after_mlp_layer": "MLP+Residual",
     }
-    key_colors = ["#ff7f0e", "#d62728", "#8c564b", "#17becf"]
+    key_colors = ["#ff7f0e", "#d62728", "#ff9896", "#8c564b", "#17becf"]
 
     for i, dump_name in enumerate(key_dumps):
         x_vals = []
@@ -654,7 +865,8 @@ def generate_charts(results: List[DumpMetrics], output_dir: str) -> list:
     ax.grid(True, alpha=0.3)
     ax.axhline(y=95, color="green", linestyle="--", alpha=0.5)
     ax.axhline(y=99, color="blue", linestyle="--", alpha=0.3)
-    ax.set_ylim(bottom=max(0, min(r.within_1ulp_pct for r in results) - 5), top=105)
+    all_w1 = [r.within_1ulp_pct for r in results]
+    ax.set_ylim(bottom=max(0, min(all_w1) - 5), top=105)
     fig.tight_layout()
     path = os.path.join(output_dir, "within_1ulp_by_layer.png")
     fig.savefig(path, dpi=150)
@@ -663,17 +875,10 @@ def generate_charts(results: List[DumpMetrics], output_dir: str) -> list:
     print(f"  Saved: {path}")
 
     # ── Chart 3: SNR Heatmap ──
-    # Use common dump points across MoE layers for a clean heatmap
-    # Determine which dump names appear most frequently
     moe_layers = [l for l in layer_set if l >= 1]
-    if moe_layers:
-        # Get dump names that appear in most MoE layers
-        heatmap_dumps = MOE_LAYER_DUMPS
-    else:
-        heatmap_dumps = DENSE_LAYER_DUMPS
+    heatmap_dumps = MOE_LAYER_DUMPS if moe_layers else DENSE_LAYER_DUMPS
 
-    # Build heatmap matrix: rows=layers, cols=dump_names
-    heatmap_layers = [l for l in layer_set if l >= 0]  # exclude -1 for cleaner heatmap
+    heatmap_layers = [l for l in layer_set if l >= 0]
     heatmap_data = np.full((len(heatmap_layers), len(heatmap_dumps)), np.nan)
 
     for i, layer_idx in enumerate(heatmap_layers):
@@ -683,7 +888,7 @@ def generate_charts(results: List[DumpMetrics], output_dir: str) -> list:
                 val = matched[0].snr_db
                 heatmap_data[i, j] = val if math.isfinite(val) else 100.0
 
-    fig, ax = plt.subplots(figsize=(18, max(10, len(heatmap_layers) * 0.35)))
+    fig, ax = plt.subplots(figsize=(20, max(10, len(heatmap_layers) * 0.35)))
     heatmap_display = np.nan_to_num(heatmap_data, nan=0.0)
     vmax = min(100.0, max(70.0, np.nanmax(heatmap_display)))
 
@@ -692,19 +897,17 @@ def generate_charts(results: List[DumpMetrics], output_dir: str) -> list:
         norm=Normalize(vmin=0, vmax=vmax),
     )
 
-    # X-axis: dump point names (rotated)
     ax.set_xticks(range(len(heatmap_dumps)))
     short_names = [d.replace("grouped_topk_", "gt_").replace("after_", "")
                    for d in heatmap_dumps]
-    ax.set_xticklabels(short_names, fontsize=8, rotation=45, ha='right')
+    ax.set_xticklabels(short_names, fontsize=7, rotation=45, ha='right')
 
-    # Y-axis: layer indices
     ax.set_yticks(range(len(heatmap_layers)))
     ax.set_yticklabels([str(l) for l in heatmap_layers], fontsize=8)
 
     ax.set_xlabel("Dump Point", fontsize=12)
     ax.set_ylabel("Layer Index", fontsize=12)
-    ax.set_title("SNR Heatmap (dB) — All Layers × All Dump Points", fontsize=14)
+    ax.set_title("SNR Heatmap (dB) - All Layers x All Dump Points", fontsize=14)
 
     fig.colorbar(im, ax=ax, label="SNR (dB)", shrink=0.8)
     fig.tight_layout()
@@ -737,7 +940,6 @@ def generate_charts(results: List[DumpMetrics], output_dir: str) -> list:
     ax.plot(x_positions, snr_values, linewidth=0.8, alpha=0.7, color="#1f77b4")
     ax.scatter(x_positions, snr_values, c=colors, s=5, alpha=0.8, zorder=5)
 
-    # Mark layer boundaries
     for boundary in layer_boundaries:
         ax.axvline(x=boundary, color="gray", linestyle=":", alpha=0.3)
 
@@ -748,7 +950,6 @@ def generate_charts(results: List[DumpMetrics], output_dir: str) -> list:
     ax.axhline(y=50, color="green", linestyle="--", alpha=0.5)
     ax.axhline(y=60, color="blue", linestyle="--", alpha=0.3)
 
-    # Add legend for stages
     from matplotlib.patches import Patch
     legend_elements = [Patch(facecolor=c, label=s) for s, c in stage_colors.items()
                        if any(r.stage == s for r in results)]
@@ -788,9 +989,13 @@ def main():
         "--output-charts-dir", type=str, default=None,
         help="Directory to save charts (default: same as report dir)",
     )
+    parser.add_argument(
+        "--output-excel", type=str, default=None,
+        help="Path to save Excel report (default: auto based on report path)",
+    )
     args = parser.parse_args()
 
-    print(f"Dump 数据精度对比:")
+    print(f"Dump data precision comparison:")
     print(f"  Baseline (H20):    {args.baseline_dir}")
     print(f"  Test (Ascend):     {args.test_dir}")
     print()
@@ -824,6 +1029,17 @@ def main():
         print(f"\nGenerating charts to {charts_dir}...")
         saved = generate_charts(results, charts_dir)
         print(f"  Generated {len(saved)} charts")
+
+    # Generate Excel report
+    excel_path = args.output_excel
+    if not excel_path and args.output_report:
+        base = os.path.splitext(args.output_report)[0]
+        excel_path = base + ".xlsx"
+
+    if excel_path:
+        print(f"\nGenerating Excel report...")
+        saved_path = generate_excel_report(results, excel_path)
+        print(f"  Saved: {saved_path}")
 
 
 if __name__ == "__main__":
