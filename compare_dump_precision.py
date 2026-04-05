@@ -131,12 +131,15 @@ STAGE_NAMES = {
     "qkv_proj_input": "Attention",
     "qkv_proj_weight": "Attention",
     "after_qkv_proj": "Attention",
-    "after_attn_op": "Attention",
-    "after_attn_layer": "Attention Output",
+    "after_self_attn": "Attention",
+    "o_proj_weight": "Attention",
+    "after_o_proj": "Attention Output",
     "after_attn_add_residual": "Attention+Residual",
     "after_post_attention_layernorm": "Post-Attn LayerNorm",
+    "gate_up_proj_weight": "Dense FFN",
     "after_ffn_gate_up_proj": "Dense FFN",
     "after_ffn_act_fn": "Dense FFN",
+    "down_proj_weight": "Dense FFN",
     "experts_input": "MoE Entry",
     "experts_e_score_correction_bias": "MoE Entry",
     "after_router": "MoE Entry",
@@ -157,31 +160,35 @@ STAGE_NAMES = {
     "after_mlp_layer": "MLP+Residual",
 }
 
-# Dense 层: 12 个文件
+# Dense 层: 最多 15 个文件
 DENSE_LAYER_DUMPS = [
     "input",
     "after_input_layernorm",
     "qkv_proj_input",
     "qkv_proj_weight",
     "after_qkv_proj",
-    "after_attn_op",
-    "after_attn_layer",
+    "after_self_attn",
+    "o_proj_weight",
+    "after_o_proj",
     "after_attn_add_residual",
     "after_post_attention_layernorm",
+    "gate_up_proj_weight",
     "after_ffn_gate_up_proj",
     "after_ffn_act_fn",
+    "down_proj_weight",
     "after_mlp_layer",
 ]
 
-# MoE 层: 最多 27 个文件
+# MoE 层: 最多 28 个文件
 MOE_LAYER_DUMPS = [
     "input",
     "after_input_layernorm",
     "qkv_proj_input",
     "qkv_proj_weight",
     "after_qkv_proj",
-    "after_attn_op",
-    "after_attn_layer",
+    "after_self_attn",
+    "o_proj_weight",
+    "after_o_proj",
     "after_attn_add_residual",
     "after_post_attention_layernorm",
     # MoE 入口

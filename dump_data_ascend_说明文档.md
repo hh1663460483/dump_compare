@@ -106,8 +106,9 @@ Input IDs
 | 3 | `layer{idx}_qkv_proj_input.bin` | Attention 输入 hidden_states | HYV3Attention 入口 | L471 |
 | 4 | `layer{idx}_qkv_proj_weight.bin` | QKV 投影权重矩阵 | qkv_proj.weight | L472 |
 | 5 | `layer{idx}_after_qkv_proj.bin` | QKV 投影输出（Q/K/V 拼接张量） | qkv_proj 之后 | L476 |
-| 6 | `layer{idx}_after_attn_op.bin` | 注意力计算输出（attention operation） | attn 计算之后 | L498 |
-| 7 | `layer{idx}_after_attn_layer.bin` | 注意力计算最终输出（o_proj 之后） | self_attn 输出 | L611 |
+| 6 | `layer{idx}_after_self_attn.bin` | 自注意力计算输出 | self_attn 计算之后 | L498 |
+| 6a | `layer{idx}_o_proj_weight.bin` | O 投影权重矩阵 | o_proj.weight | — |
+| 7 | `layer{idx}_after_o_proj.bin` | O 投影输出 | o_proj 之后 | L611 |
 | 7a | `layer{idx}_after_attn_add_residual.bin` | 注意力子层 + 残差连接 | self_attn + 残差之后 | — |
 | 7b | `layer{idx}_after_post_attention_layernorm.bin` | post_attention_layernorm (RMSNorm) 输出 | post_attention_layernorm 之后 | — |
 
@@ -115,8 +116,10 @@ Input IDs
 
 | 序号 | 文件名 | 数据含义 | 模型位置 | 源码行 |
 |:----:|--------|---------|---------|:------:|
+| 8a0 | `layer{idx}_gate_up_proj_weight.bin` | gate_up_proj 权重矩阵 | FeedForward.gate_up_proj.weight | — |
 | 8a | `layer{idx}_after_ffn_gate_up_proj.bin` | gate_up_proj 线性投影输出 | FeedForward.gate_up_proj 之后 | L133 |
 | 8b | `layer{idx}_after_ffn_act_fn.bin` | 激活函数 (SiluAndMul) 输出 | FeedForward.act_fn 之后 | L137 |
+| 8b0 | `layer{idx}_down_proj_weight.bin` | down_proj 权重矩阵 | FeedForward.down_proj.weight | — |
 
 #### MoE 子层（仅 MoE 层）
 
@@ -172,7 +175,7 @@ Input IDs
 
 ## 4. 执行顺序流程图
 
-### 4.1 Dense 层（idx < first_k_dense_replace）— 每层 12 个 dump 文件
+### 4.1 Dense 层（idx < first_k_dense_replace）— 每层最多 15 个 dump 文件
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
@@ -197,13 +200,17 @@ Input IDs
 │  │  ⑤ layer{idx}_after_qkv_proj.bin               │             │
 │  │  │                                               │             │
 │  │  ▼                                               │             │
-│  │  RoPE → Attention 计算 → o_proj                  │             │
+│  │  RoPE → Self Attention 计算                      │             │
 │  │  │                                               │             │
-│  │  ⑥ layer{idx}_after_attn_op.bin                 │             │
+│  │  ⑥ layer{idx}_after_self_attn.bin              │             │
+│  │  │                                               │             │
+│  │  ▼                                               │             │
+│  │  ⑥a layer{idx}_o_proj_weight.bin               │             │
+│  │  o_proj (RowParallelLinear)                     │             │
+│  │  │                                               │             │
+│  │  ⑦ layer{idx}_after_o_proj.bin                 │             │
 │  └──┼──────────────────────────────────────────────┘             │
 │     │                                                             │
-│  ⑦ layer{idx}_after_attn_layer.bin                               │
-│  │                                                                │
 │     ▼  (+残差连接)                                                │
 │                                                                   │
 │  ⑦a layer{idx}_after_attn_add_residual.bin                       │
@@ -211,11 +218,12 @@ Input IDs
 │  ▼                                                                │
 │  post_attention_layernorm (RMSNorm)                              │
 │  │                                                                │
-│  ⑦b layer{idx}_after_post_attention_layernorm.bin                │                              │
+│  ⑦b layer{idx}_after_post_attention_layernorm.bin                │
 │  │                                                                │
 │  ▼                                                                │
 │  ┌─────────── FeedForward (Dense FFN) ────────────┐             │
 │  │                                                  │             │
+│  │  ⑧0 layer{idx}_gate_up_proj_weight.bin         │             │
 │  │  gate_up_proj (MergedColumnParallelLinear)      │             │
 │  │  │                                               │             │
 │  │  ⑧ layer{idx}_after_ffn_gate_up_proj.bin       │             │
@@ -226,6 +234,7 @@ Input IDs
 │  │  ⑨ layer{idx}_after_ffn_act_fn.bin             │             │
 │  │  │                                               │             │
 │  │  ▼                                               │             │
+│  │  ⑨a layer{idx}_down_proj_weight.bin            │             │
 │  │  down_proj (RowParallelLinear)                  │             │
 │  └──┼──────────────────────────────────────────────┘             │
 │     │                                                             │
@@ -240,7 +249,7 @@ Input IDs
 
 ---
 
-### 4.2 MoE 层（idx >= first_k_dense_replace）— 每层最多 21 个 dump 文件
+### 4.2 MoE 层（idx >= first_k_dense_replace）— 每层最多 28 个 dump 文件
 
 ```
 ┌───────────────────────────────────────────────────────────────────────────┐
@@ -252,10 +261,9 @@ Input IDs
 │  ▼                                                                        │
 │  ┌─────────── Attention（同 Dense 层）──────────┐                        │
 │  │  ③ qkv_proj_input → ④ qkv_proj_weight        │                        │
-│  │  → ⑤ after_qkv_proj → ⑥ after_attn_op        │                        │
+│  │  → ⑤ after_qkv_proj → ⑥ after_self_attn      │                        │
+│  │  → ⑥a o_proj_weight → ⑦ after_o_proj         │                        │
 │  └───────────────────────────────────────────────┘                        │
-│  │                                                                        │
-│  ⑦ layer{idx}_after_attn_layer.bin                                       │
 │  │                                                                        │
 │     ▼  (+残差连接)                                                        │
 │                                                                           │
@@ -264,7 +272,7 @@ Input IDs
 │  ▼                                                                        │
 │  post_attention_layernorm (RMSNorm)                                      │
 │  │                                                                        │
-│  ⑦b layer{idx}_after_post_attention_layernorm.bin                        │                                      │
+│  ⑦b layer{idx}_after_post_attention_layernorm.bin                        │
 │  │                                                                        │
 │  ▼                                                                        │
 │  ┌──────────────────── HYV3MoEFused ──────────────────────────────┐      │
@@ -345,8 +353,8 @@ Input IDs
 HYV3DecoderLayer.forward()                        [hunyuan_v3.py]
 ├── dump: input, after_input_layernorm
 ├── HYV3Attention.forward()
-│   ├── dump: qkv_proj_input, qkv_proj_weight, after_qkv_proj, after_attn_op
-├── dump: after_attn_layer, after_attn_add_residual, after_post_attention_layernorm
+│   ├── dump: qkv_proj_input, qkv_proj_weight, after_qkv_proj, after_self_attn, o_proj_weight
+├── dump: after_o_proj, after_attn_add_residual, after_post_attention_layernorm
 │
 ├── [Dense 层] HYV3FeedForward.forward()
 │   ├── dump: after_ffn_gate_up_proj, after_ffn_act_fn
@@ -406,5 +414,5 @@ HYV3DecoderLayer.forward()                        [hunyuan_v3.py]
 |------|---------|--------|
 | 层索引范围 | `idx < first_k_dense_replace` | `idx >= first_k_dense_replace` |
 | MLP 类型 | HYV3FeedForward | HYV3MoEFused |
-| dump 文件数/层 | 9 个 | 最多 21 个 (9 + 10 + 2) |
+| dump 文件数/层 | 最多 15 个 | 最多 28 个 (11 + 10 + 2 + 5) |
 | 路由相关 dump | 无 | 10 个 (experts_selector) + 2 个 (fused_moe) |

@@ -116,6 +116,21 @@ python compare_dump_precision.py \
 | Good | >= 50 dB | >= 95% |
 | Needs Investigation | < 50 dB | < 95% |
 
+## Dump 文件命名规则
+
+每个 dump 文件命名格式为 `layer{idx}_{dump_name}.bin`，其中 `idx` 为层索引（0~39）。
+
+### 每层关键 dump 点（按执行顺序）
+
+**Attention 子层：**
+`input` → `after_input_layernorm` → `qkv_proj_input` / `qkv_proj_weight` → `after_qkv_proj` → `after_self_attn` → `o_proj_weight` → `after_o_proj` → `after_attn_add_residual` → `after_post_attention_layernorm`
+
+**Dense FFN 子层（仅 layer 0）：**
+`gate_up_proj_weight` → `after_ffn_gate_up_proj` → `after_ffn_act_fn` → `down_proj_weight` → `after_mlp_layer`
+
+**MoE 子层（layer 1~39）：**
+`experts_input` → `after_router` → `grouped_topk_*`（10 个路由选择 dump） → `fused_topk_*`（2 个） → `after_experts_shared` / `after_experts_fused` → `after_mlp_layer`
+
 ## 数据格式
 
 Dump 文件扩展名为 `.bin`，实际使用 `torch.save()` 序列化，加载方式：
