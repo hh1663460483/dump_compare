@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Dump data (large binary files)
+dump_data_ascend/
+dump_data_h20/
+
+# Generated outputs
+dump_charts/
+dump_precision_report.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
